@@ -1,281 +1,414 @@
-# app_logic/main_controller.py
-# This module will act as the main controller orchestrating
-# interactions between the GUI, network, and cryptography parts.
-
 import sys
+import threading # For listener threads per connection
 from PyQt5.QtWidgets import QApplication
-from PyQt5.QtCore import QObject, pyqtSlot, QThread, pyqtSignal
+from PyQt5.QtCore import QObject, pyqtSlot, QThread, pyqtSignal, QMetaObject, Qt
 
-# Assuming other modules will be structured and importable
-# from gui.gui_main_window import ChatGUI
-# from network_core.tcp_handler import TCPServer, TCPClient # Simplified
-# from security.diffie_hellman import DHExchange
-# from security.session_crypto import SessionCipher # Assuming this will be created
+from gui.gui_main_window import ChatGUI
+from network_core.tcp_handler import TCPServer, TCPClient
+from security.diffie_hellman import DHExchange
+from security.session_crypto import SessionCipher
 
-# Placeholder for SessionCipher if not created yet
-class SessionCipher:
-    def __init__(self, key):
-        self.key = key
-        print(f"SessionCipher initialized with key: {key.hex() if key else None}")
+# Helper functions from main.py (CLI tester) - might move to a common utils module
+def send_framed_data(sock_or_client, data: bytes):
+    if isinstance(sock_or_client, TCPClient):
+        return sock_or_client.send_data(data)
+    else:
+        msg_len = len(data).to_bytes(4, 'big')
+        try:
+            sock_or_client.sendall(msg_len + data)
+            return True
+        except Exception: return False
 
-    def encrypt(self, plaintext_bytes: bytes) -> bytes:
-        if not self.key: return plaintext_bytes # No-op if key not set
-        # Placeholder for actual encryption (e.g., Fernet)
-        print(f"Encrypting (placeholder): {plaintext_bytes}")
-        return b"encrypted_" + plaintext_bytes
+def receive_framed_data(sock_or_client):
+    if isinstance(sock_or_client, TCPClient):
+        return sock_or_client.receive_data()
+    else:
+        try:
+            raw_msglen = sock_or_client.recv(4)
+            if not raw_msglen: return None
+            msglen = int.from_bytes(raw_msglen, 'big')
+            data = bytearray()
+            while len(data) < msglen:
+                packet = sock_or_client.recv(msglen - len(data))
+                if not packet: return None
+                data.extend(packet)
+            return bytes(data)
+        except Exception: return None
 
-    def decrypt(self, ciphertext_bytes: bytes) -> bytes:
-        if not self.key: return ciphertext_bytes # No-op if key not set
-        # Placeholder for actual decryption
-        print(f"Decrypting (placeholder): {ciphertext_bytes}")
-        if ciphertext_bytes.startswith(b"encrypted_"):
-            return ciphertext_bytes[len(b"encrypted_"):]
-        return ciphertext_bytes
 
+class NetworkWorker(QObject):
+    message_received_signal = pyqtSignal(str, str)  # peer_id, message_text
+    connection_status_signal = pyqtSignal(str, str, str)  # peer_id, type ("info", "error", "success"), message
+    new_peer_connected_signal = pyqtSignal(str)  # peer_id (e.g., "host:port")
+    server_status_signal = pyqtSignal(str, bool) # message, is_error (True if error, False if success/info)
 
-# --- Network Worker (for handling server and client connections in a separate thread) ---
-class NetworkHandler(QObject):
-    message_received_signal = pyqtSignal(str, str) # peer_id, message
-    connection_status_signal = pyqtSignal(str, str) # peer_id, status ("connected", "disconnected", "error")
-    new_peer_signal = pyqtSignal(str) # peer_id (e.g. "host:port")
-
-    # For DH Exchange
-    # For simplicity, we'll handle DH within client/server connection logic for now
-    # A more robust system might have explicit states/signals for DH steps
-
-    def __init__(self, host_ip='0.0.0.0', listen_port=0):
+    def __init__(self, host_ip='0.0.0.0'):
         super().__init__()
         self.host_ip = host_ip
-        self.listen_port = listen_port
+        self.listen_port = 0
         self.tcp_server = None
-        self.clients = {} # Stores active TCPClient instances: peer_id -> {client: TCPClient, session_cipher: SessionCipher}
-        self.dh_exchanges = {} # peer_id -> DHExchange
-        self.server_thread = None
+        self.server_running_flag = threading.Event() # To signal TCPServer's loop to stop
 
-    def start_server(self, port_to_listen):
-        self.listen_port = port_to_listen
-        # The TCPServer from tcp_handler needs to be adapted or used carefully with threads
-        # For now, let's assume TCPServer's on_new_client_callback is run in a thread by TCPServer itself
-        # And that callback will be self.handle_new_server_connection
+        # peer_id -> {"socket": sock, "client_obj": TCPClient_obj, "cipher": SessionCipher, "listener_thread": Thread}
+        self.active_connections = {}
+        self.connections_lock = threading.Lock() # To protect access to active_connections
 
-        # This part needs to be carefully designed.
-        # The TCPServer in tcp_handler.py starts its own listening loop.
-        # We need a way to integrate it with this QObject based handler.
-        # For now, this is a conceptual placeholder.
-        print(f"NetworkHandler: Attempting to start server on {self.host_ip}:{self.listen_port}")
-        # self.tcp_server = TCPServer(self.host_ip, self.listen_port, self.handle_new_server_connection)
-        # self.server_thread = threading.Thread(target=self.tcp_server.start, daemon=True)
-        # self.server_thread.start()
-        self.connection_status_signal.emit("SERVER", f"Server listening on {self.host_ip}:{self.listen_port} (Conceptual)")
+    @pyqtSlot(int)
+    def start_server_slot(self, port: int):
+        self.listen_port = port
+        if self.tcp_server and self.server_running_flag.is_set():
+            self.server_status_signal.emit(f"Server already running on {self.host_ip}:{self.listen_port}", True)
+            return
 
+        self.server_running_flag.set() # Signal that server should be running
+        self.tcp_server = TCPServer(self.host_ip, self.listen_port, self._handle_new_server_connection)
 
-    @pyqtSlot(object, tuple) # conn, addr
-    def handle_new_server_connection(self, conn, addr):
-        """Callback for TCPServer when a new client connects."""
-        peer_id = f"{addr[0]}:{addr[1]}"
-        print(f"NetworkHandler: New incoming connection from {peer_id}")
-        self.new_peer_signal.emit(peer_id)
-        self.connection_status_signal.emit(peer_id, "connected_inbound")
+        # TCPServer.start() is blocking, run it in its own thread
+        # This thread is for the server's main listening loop (accepting new connections)
+        server_loop_thread = threading.Thread(target=self.tcp_server.start, daemon=True)
+        server_loop_thread.start()
 
-        # Simplified DH Exchange (Initiated by server side for incoming connection)
-        # In a real scenario, one side (e.g. connector) initiates DH.
-        dh = DHExchange()
-        # For incoming, let's assume this side (server) dictates params for now.
-        # This needs refinement: client should initiate or a protocol for who sends params first.
-        # params_bytes, own_pub_key_bytes = dh.generate_parameters_and_keys()
-
-        # conn.sendall(params_bytes) # Frame this!
-        # conn.sendall(own_pub_key_bytes) # Frame this!
-        # peer_pub_key_bytes = conn.recv(...) # Frame this!
-
-        # shared_secret = dh.calculate_shared_secret(peer_pub_key_bytes)
-        # if shared_secret:
-        #     self.clients[peer_id] = {'socket': conn, 'session_cipher': SessionCipher(shared_secret)}
-        #     self.dh_exchanges[peer_id] = dh
-        #     self.connection_status_signal.emit(peer_id, "dh_complete")
-        #     # Start listening loop for this client
-        #     # client_listener_thread = threading.Thread(target=self.listen_to_client, args=(conn, peer_id), daemon=True)
-        #     # client_listener_thread.start()
-        # else:
-        #     self.connection_status_signal.emit(peer_id, "dh_failed")
-        #     conn.close()
-        print(f"NetworkHandler: DH Exchange and client listening loop for {peer_id} (Conceptual - NOT IMPLEMENTED YET)")
+        # Check if server started successfully (e.g. port not in use)
+        # This is a bit tricky as TCPServer.start() blocks.
+        # A robust way is for TCPServer to emit a signal or use a callback on successful bind.
+        # For now, assume it starts if no immediate exception.
+        # TCPServer's print statement will indicate listening.
+        self.server_status_signal.emit(f"Server started, listening on {self.host_ip}:{self.listen_port}", False)
 
 
-    @pyqtSlot(str, str) # host, port
-    def connect_to_peer(self, host, port_str):
+    def _handle_new_server_connection(self, connection_socket, client_address):
+        """Callback for TCPServer, runs in a thread created by TCPServer."""
+        peer_id = f"{client_address[0]}:{client_address[1]}"
+        self.connection_status_signal.emit(peer_id, "info", f"Incoming connection from {peer_id}. Starting DH exchange...")
+
+        dh_responder = DHExchange()
+        try:
+            # DH Responder Logic
+            params_bytes = receive_framed_data(connection_socket)
+            if not params_bytes: raise Exception("Failed to receive DH parameters.")
+            self.connection_status_signal.emit(peer_id, "info", "Received DH parameters.")
+
+            client_pub_key_bytes = receive_framed_data(connection_socket)
+            if not client_pub_key_bytes: raise Exception("Failed to receive client public key.")
+            self.connection_status_signal.emit(peer_id, "info", "Received client public key.")
+
+            own_pub_key_bytes = dh_responder.generate_keys_with_parameters(params_bytes)
+            if not own_pub_key_bytes: raise Exception("Failed to generate DH keys with client parameters.")
+
+            if not send_framed_data(connection_socket, own_pub_key_bytes):
+                raise Exception("Failed to send own public key.")
+            self.connection_status_signal.emit(peer_id, "info", "Sent own public key.")
+
+            shared_secret = dh_responder.calculate_shared_secret(client_pub_key_bytes)
+            if not shared_secret: raise Exception("Failed to calculate shared secret.")
+
+            session_cipher = SessionCipher(shared_secret)
+            self.connection_status_signal.emit(peer_id, "success", f"DH Exchange with {peer_id} complete.")
+
+            with self.connections_lock:
+                listener_thread = threading.Thread(target=self._listen_on_connection,
+                                                   args=(connection_socket, peer_id, session_cipher), daemon=True)
+                self.active_connections[peer_id] = {
+                    "socket": connection_socket, "cipher": session_cipher,
+                    "listener_thread": listener_thread, "client_obj": None
+                }
+            listener_thread.start()
+            self.new_peer_connected_signal.emit(peer_id)
+
+        except Exception as e:
+            self.connection_status_signal.emit(peer_id, "error", f"DH Exchange failed with {peer_id}: {e}")
+            connection_socket.close()
+
+
+    @pyqtSlot(str, str) # host, port_str
+    def connect_to_peer_slot(self, host: str, port_str: str):
         peer_id = f"{host}:{port_str}"
         try:
             port = int(port_str)
-            if peer_id in self.clients and self.clients[peer_id].get('socket') and self.clients[peer_id]['socket'].connected:
-                print(f"Already connected to {peer_id}")
-                self.connection_status_signal.emit(peer_id, "already_connected")
-                return
+            with self.connections_lock:
+                if peer_id in self.active_connections:
+                    self.connection_status_signal.emit(peer_id, "info", f"Already connected or connecting to {peer_id}.")
+                    return
 
-            print(f"NetworkHandler: Attempting to connect to {peer_id}")
-            # client = TCPClient(host, port) # From tcp_handler
-            # client_socket = client.connect() # This blocks, so should be in a thread if GUI is responsive
+            self.connection_status_signal.emit(peer_id, "info", f"Attempting to connect to {peer_id}...")
+            tcp_client = TCPClient(host, port)
+            client_socket = tcp_client.connect() # This is blocking.
 
-            # if client_socket:
-            #     self.connection_status_signal.emit(peer_id, "connected_outbound")
-            #     self.new_peer_signal.emit(peer_id)
+            if not client_socket or not tcp_client.connected:
+                raise ConnectionError(f"Failed to connect to {peer_id}.")
 
-            #     # Simplified DH Exchange (Initiated by connector)
-            #     dh = DHExchange()
-            #     # Peer A (connector) generates parameters and its key pair
-            #     params_bytes, own_pub_key_bytes = dh.generate_parameters_and_keys()
-            #     serialized_params = dh.get_parameters_bytes()
+            self.connection_status_signal.emit(peer_id, "info", f"TCP connected to {peer_id}. Starting DH exchange...")
 
-            #     client.send_data(serialized_params) # Assumes tcp_handler.send_data frames it
-            #     client.send_data(own_pub_key_bytes)
+            # DH Initiator Logic
+            dh_initiator = DHExchange()
+            params, own_pub_key_bytes = dh_initiator.generate_parameters_and_keys()
+            params_bytes_to_send = dh_initiator.get_parameters_bytes()
 
-            #     peer_pub_key_bytes = client.receive_data() # Assumes tcp_handler.receive_data unframes it
-            #     if peer_pub_key_bytes:
-            #         shared_secret = dh.calculate_shared_secret(peer_pub_key_bytes)
-            #         if shared_secret:
-            #             self.clients[peer_id] = {'client': client, 'session_cipher': SessionCipher(shared_secret)}
-            #             self.dh_exchanges[peer_id] = dh
-            #             self.connection_status_signal.emit(peer_id, "dh_complete")
-            #             # Start listening loop for this client
-            #             # client_listener_thread = threading.Thread(target=self.listen_to_client_outbound, args=(client, peer_id), daemon=True)
-            #             # client_listener_thread.start()
-            #         else:
-            #             self.connection_status_signal.emit(peer_id, "dh_failed")
-            #             client.close()
-            #     else:
-            #         self.connection_status_signal.emit(peer_id, "dh_no_peer_pubkey")
-            #         client.close()
-            # else:
-            #     self.connection_status_signal.emit(peer_id, "connection_failed")
-            print(f"NetworkHandler: Connection and DH for {peer_id} (Conceptual - NOT IMPLEMENTED YET)")
+            if not send_framed_data(tcp_client, params_bytes_to_send):
+                raise Exception("Failed to send DH parameters.")
+            self.connection_status_signal.emit(peer_id, "info", "Sent DH parameters.")
+
+            if not send_framed_data(tcp_client, own_pub_key_bytes):
+                raise Exception("Failed to send own public key.")
+            self.connection_status_signal.emit(peer_id, "info", "Sent own public key.")
+
+            server_pub_key_bytes = receive_framed_data(tcp_client)
+            if not server_pub_key_bytes: raise Exception("Failed to receive server public key.")
+            self.connection_status_signal.emit(peer_id, "info", "Received server public key.")
+
+            shared_secret = dh_initiator.calculate_shared_secret(server_pub_key_bytes)
+            if not shared_secret: raise Exception("Failed to calculate shared secret.")
+
+            session_cipher = SessionCipher(shared_secret)
+            self.connection_status_signal.emit(peer_id, "success", f"DH Exchange with {peer_id} complete.")
+
+            with self.connections_lock:
+                listener_thread = threading.Thread(target=self._listen_on_connection,
+                                                   args=(tcp_client, peer_id, session_cipher), daemon=True)
+                self.active_connections[peer_id] = {
+                    "socket": None, "client_obj": tcp_client, "cipher": session_cipher,
+                    "listener_thread": listener_thread
+                }
+            listener_thread.start()
+            self.new_peer_connected_signal.emit(peer_id)
 
         except ValueError:
-            self.connection_status_signal.emit(peer_id, "invalid_port")
+            self.connection_status_signal.emit(peer_id, "error", "Invalid port number.")
+        except ConnectionError as ce:
+             self.connection_status_signal.emit(peer_id, "error", str(ce))
         except Exception as e:
-            self.connection_status_signal.emit(peer_id, f"error: {e}")
+            self.connection_status_signal.emit(peer_id, "error", f"Connection or DH failed with {peer_id}: {e}")
+            if 'tcp_client' in locals() and tcp_client:
+                tcp_client.close()
 
 
-    @pyqtSlot(str, str) # peer_id, message
-    def send_message(self, peer_id, message_text):
-        if peer_id in self.clients:
-            client_info = self.clients[peer_id]
-            # tcp_client_or_socket = client_info.get('client') or client_info.get('socket')
-            # session_cipher = client_info.get('session_cipher')
+    def _listen_on_connection(self, conn_obj, peer_id: str, session_cipher: SessionCipher):
+        """Listens for messages on an active connection (either TCPClient or raw socket)."""
+        is_client_obj = isinstance(conn_obj, TCPClient)
+        source_name = "TCPClient" if is_client_obj else "socket"
+        # print(f"DEBUG: Listener started for {peer_id} on {source_name}")
+        try:
+            while True: # self.server_running_flag.is_set(): # Check a flag if worker is shutting down
+                encrypted_data = receive_framed_data(conn_obj)
+                if not encrypted_data:
+                    self.connection_status_signal.emit(peer_id, "info", f"Connection closed by {peer_id}.")
+                    break
 
-            # if tcp_client_or_socket and session_cipher:
-            #     encrypted_message = session_cipher.encrypt(message_text.encode('utf-8'))
-            #     if isinstance(tcp_client_or_socket, TCPClient): # Outbound connection
-            #         success = tcp_client_or_socket.send_data(encrypted_message)
-            #     else: # Inbound connection (raw socket)
-            #         # Need framing for raw sockets
-            #         msg_len_bytes = len(encrypted_message).to_bytes(4, 'big')
-            #         tcp_client_or_socket.sendall(msg_len_bytes + encrypted_message)
-            #         success = True # Assume success if no immediate error
+                decrypted_bytes = session_cipher.decrypt(encrypted_data)
+                if not decrypted_bytes: # Decryption failed
+                    self.connection_status_signal.emit(peer_id, "error", "Failed to decrypt message. Possible key mismatch or data corruption.")
+                    # Decide if to break or continue. For now, continue.
+                    continue
 
-            #     if success:
-            #         print(f"Message sent to {peer_id}: {message_text}")
-            #     else:
-            #         print(f"Failed to send message to {peer_id}")
-            #         self.connection_status_signal.emit(peer_id, "send_error")
-            # else:
-            #     print(f"No active connection or cipher for {peer_id} to send message.")
-            #     self.connection_status_signal.emit(peer_id, "not_ready_to_send")
-            print(f"NetworkHandler: Sending message to {peer_id}: '{message_text}' (Conceptual - NOT IMPLEMENTED YET)")
+                self.message_received_signal.emit(peer_id, decrypted_bytes.decode('utf-8', errors='replace'))
 
-        else:
-            print(f"Unknown peer_id {peer_id} for sending message.")
+        except Exception as e:
+            self.connection_status_signal.emit(peer_id, "error", f"Error listening to {peer_id}: {e}")
+        finally:
+            # print(f"DEBUG: Listener stopped for {peer_id}")
+            self.cleanup_connection(peer_id)
 
-    # Placeholder for listening loops
-    # def listen_to_client(self, conn_socket, peer_id): ...
-    # def listen_to_client_outbound(self, tcp_client, peer_id): ...
+
+    @pyqtSlot(str, str) # peer_id, message_text
+    def send_message_to_peer_slot(self, peer_id: str, message_text: str):
+        with self.connections_lock:
+            conn_info = self.active_connections.get(peer_id)
+
+        if not conn_info:
+            self.connection_status_signal.emit(peer_id, "error", f"Not connected to {peer_id}.")
+            return
+
+        cipher = conn_info["cipher"]
+        conn_obj = conn_info["client_obj"] or conn_info["socket"] # TCPClient or raw socket
+
+        if not cipher or not conn_obj:
+            self.connection_status_signal.emit(peer_id, "error", f"Connection or cipher missing for {peer_id}.")
+            return
+
+        try:
+            encrypted_message = cipher.encrypt(message_text.encode('utf-8'))
+            if not encrypted_message:
+                raise Exception("Encryption failed (returned empty).")
+
+            if not send_framed_data(conn_obj, encrypted_message):
+                raise Exception("Failed to send data via socket/client.")
+            # self.message_received_signal.emit("Me", f"To {peer_id}: {message_text}") # Display own sent message
+        except Exception as e:
+            self.connection_status_signal.emit(peer_id, "error", f"Failed to send message to {peer_id}: {e}")
+            self.cleanup_connection(peer_id) # Assume connection is problematic
+
+
+    def cleanup_connection(self, peer_id: str):
+        with self.connections_lock:
+            conn_info = self.active_connections.pop(peer_id, None)
+
+        if conn_info:
+            if conn_info["client_obj"]:
+                conn_info["client_obj"].close()
+            elif conn_info["socket"]:
+                try: conn_info["socket"].shutdown(socket.SHUT_RDWR)
+                except: pass
+                conn_info["socket"].close()
+
+            # listener_thread = conn_info.get("listener_thread")
+            # if listener_thread and listener_thread.is_alive():
+            #     pass # Daemon threads will exit. If not daemon, would need join with timeout.
+            self.connection_status_signal.emit(peer_id, "info", f"Cleaned up connection for {peer_id}.")
+            # Optionally, notify GUI to remove peer from active list if not handled by connection_status
+            # self.peer_disconnected_signal.emit(peer_id)
+
+
+    @pyqtSlot()
+    def stop_network_worker_slot(self):
+        self.server_status_signal.emit("Network worker stopping...", False)
+        self.server_running_flag.clear() # Signal TCPServer loop to stop (if it checks)
+        if self.tcp_server:
+            self.tcp_server.stop() # This should unblock accept and close server socket
+            self.tcp_server = None
+
+        with self.connections_lock:
+            peer_ids = list(self.active_connections.keys()) # Iterate over a copy
+        for peer_id in peer_ids:
+            self.cleanup_connection(peer_id)
+
+        self.server_status_signal.emit("Network worker stopped.", False)
+        self.thread().quit() # Quit the QThread this worker lives in
 
 
 class MainController(QObject):
     def __init__(self):
         super().__init__()
-        self.gui = ChatGUI() # from gui.gui_main_window
+        self.gui = ChatGUI()
+        self.current_chat_peer_id = None
+        self.known_peers = set()
 
-        # Setup network handler in a separate thread to avoid blocking GUI
-        self.network_thread = QThread()
-        self.network_handler = NetworkHandler() # host_ip, listen_port can be set later
-        self.network_handler.moveToThread(self.network_thread)
+        self.network_thread = QThread(self) # Parent to QThread
+        self.network_worker = NetworkWorker()
+        self.network_worker.moveToThread(self.network_thread)
 
-        # Connect signals from GUI to slots in NetworkHandler (via controller or directly)
-        self.gui.send_message_signal.connect(self.network_handler.send_message) # Will need current_peer_id logic
-        self.gui.connect_to_peer_signal.connect(self.network_handler.connect_to_peer)
+        # --- Connect GUI signals to Controller slots ---
+        self.gui.send_message_signal.connect(self.on_gui_send_message)
+        self.gui.connect_to_peer_signal.connect(self.on_gui_connect_to_peer)
+        self.gui.peer_selection_changed_signal.connect(self.on_gui_peer_selection_changed)
+        self.gui.start_server_requested_signal.connect(self.on_gui_start_server_requested)
+        self.gui.destroyed.connect(self.on_gui_destroyed) # For proper shutdown
 
-        # Connect signals from NetworkHandler to slots in GUI (or controller to update GUI)
-        self.network_handler.message_received_signal.connect(self.handle_incoming_message)
-        self.network_handler.connection_status_signal.connect(self.handle_connection_status)
-        self.network_handler.new_peer_signal.connect(self.handle_new_peer)
+        # --- Connect Worker signals to Controller slots ---
+        self.network_worker.message_received_signal.connect(self.on_worker_message_received)
+        self.network_worker.connection_status_signal.connect(self.on_worker_connection_status)
+        self.network_worker.new_peer_connected_signal.connect(self.on_worker_new_peer_connected)
+        self.network_worker.server_status_signal.connect(self.on_worker_server_status)
 
-        # Start the network thread
+        # --- Controller signals to Worker slots (queued connection) ---
+        # These ensure calls to network_worker methods happen in the network_thread
+        self.start_server_trigger = pyqtSignal(int)
+        self.connect_to_peer_trigger = pyqtSignal(str, str)
+        self.send_message_trigger = pyqtSignal(str, str)
+        self.stop_worker_trigger = pyqtSignal()
+
+        self.start_server_trigger.connect(self.network_worker.start_server_slot)
+        self.connect_to_peer_trigger.connect(self.network_worker.connect_to_peer_slot)
+        self.send_message_trigger.connect(self.network_worker.send_message_to_peer_slot)
+        self.stop_worker_trigger.connect(self.network_worker.stop_network_worker_slot, Qt.BlockingQueuedConnection) # Ensure it runs before thread quits
+
         self.network_thread.start()
-
-        # TODO: Get listening port from user via GUI or config
-        # For now, conceptual start.
-        # self.network_handler.start_server(12345) # Example port
-
-        self.current_chat_peer_id = None # To know who "Me: message" is for
-
         self.gui.show()
+        self.gui.set_status_bar_message("Application started. Please start listening or connect.", 0)
 
-    @pyqtSlot(str) # peer_id ("host:port")
-    def handle_new_peer(self, peer_id):
-        # This needs to be more robust, e.g. check if peer already in list
-        self.gui.update_peer_list([peer_id]) # Simplistic update for now
-        self.gui.append_message_to_display(f"System: New peer detected/connected: {peer_id}")
+    @pyqtSlot(str)
+    def on_gui_send_message(self, message_text: str):
+        if self.current_chat_peer_id:
+            self.send_message_trigger.emit(self.current_chat_peer_id, message_text)
+            # GUI already displays "Me: message"
+        else:
+            self.gui.set_status_bar_message("Error: No peer selected to send message.", 5000)
 
-    @pyqtSlot(str, str) # peer_id, message
-    def handle_incoming_message(self, peer_id, message):
-        # If the message is from the currently active chat peer, display it
-        # Or, if no chat is active, or if it's a new peer, perhaps highlight or notify
-        self.gui.append_message_to_display(f"{peer_id}: {message}")
+    @pyqtSlot(str, str)
+    def on_gui_connect_to_peer(self, host: str, port_str: str):
+        self.connect_to_peer_trigger.emit(host, port_str)
 
-    @pyqtSlot(str, str) # peer_id, status
-    def handle_connection_status(self, peer_id, status):
-        self.gui.append_message_to_display(f"System Status ({peer_id}): {status}")
+    @pyqtSlot(str)
+    def on_gui_peer_selection_changed(self, peer_id: str):
+        self.current_chat_peer_id = peer_id if peer_id else None
+        # GUI handles updating its display for selected peer (e.g., clearing chat history area)
+
+    @pyqtSlot(int)
+    def on_gui_start_server_requested(self, port: int):
+        self.start_server_trigger.emit(port)
+
+    @pyqtSlot(str, str) # peer_id, message_text
+    def on_worker_message_received(self, peer_id: str, message_text: str):
+        # TODO: Handle multi-chat window logic if peer_id != self.current_chat_peer_id
+        # For now, just display if it's the current chat, or always display with peer_id
+        if self.current_chat_peer_id == peer_id:
+            self.gui.update_chat_display(f"{peer_id}: {message_text}")
+        else:
+            # If chat is not active, could show a notification or just log
+            self.gui.update_chat_display(f"({peer_id}) {peer_id}: {message_text}")
+            self.gui.set_status_bar_message(f"New message from {peer_id}", 3000)
+
+
+    @pyqtSlot(str, str, str) # peer_id, type, message
+    def on_worker_connection_status(self, peer_id: str, type: str, message: str):
+        formatted_status = f"[{type.upper()}] {peer_id}: {message}"
+        self.gui.update_chat_display(f"System: {formatted_status}")
+        if type == "error":
+            self.gui.set_status_bar_message(f"Error with {peer_id}", 5000)
+        elif type == "success":
+             self.gui.set_status_bar_message(f"{peer_id} action successful.", 3000)
+
+
+    @pyqtSlot(str) # peer_id
+    def on_worker_new_peer_connected(self, peer_id: str):
+        self.known_peers.add(peer_id)
+        self.gui.update_peer_list_gui(list(self.known_peers))
+        # Optionally auto-select the new peer if no peer is currently selected
+        if not self.current_chat_peer_id:
+             items = self.gui.peer_list_widget.findItems(peer_id, Qt.MatchExactly)
+             if items:
+                 self.gui.peer_list_widget.setCurrentItem(items[0]) # This will trigger on_gui_peer_selection_changed
+
+
+    @pyqtSlot(str, bool) # message, is_error
+    def on_worker_server_status(self, message: str, is_error: bool):
+        self.gui.update_chat_display(f"Server System: {message}")
+        self.gui.set_status_bar_message(message, 5000 if is_error else 3000)
+        if not is_error: # Server started successfully
+            self.gui.start_server_action.setEnabled(False) # Disable if server is running
+            self.gui.setWindowTitle(f"P2P Secure Messenger (Listening on {self.network_worker.listen_port})")
+        # If error, start_server_action remains enabled or could be re-enabled.
+
+    @pyqtSlot()
+    def on_gui_destroyed(self):
+        print("GUI is being destroyed, shutting down network worker...")
+        self.shutdown()
 
     def shutdown(self):
-        print("Controller shutting down...")
-        if self.network_handler and self.network_handler.tcp_server:
-            self.network_handler.tcp_server.stop()
+        print("MainController shutdown initiated.")
+        # Signal the worker to stop. Use BlockingQueuedConnection if call must complete before thread exits.
+        QMetaObject.invokeMethod(self.network_worker, "stop_network_worker_slot", Qt.QueuedConnection)
+        # self.stop_worker_trigger.emit() # This is also fine if stop_network_worker_slot quits the thread
+
         self.network_thread.quit()
-        self.network_thread.wait()
-        print("Network thread finished.")
+        if not self.network_thread.wait(5000): # Wait up to 5 seconds
+            print("Network thread did not terminate gracefully, forcing termination.")
+            self.network_thread.terminate()
+            self.network_thread.wait() # Wait again after terminate
+        print("MainController shutdown complete.")
 
 
 if __name__ == '__main__':
-    # This basic main.py will be expanded significantly
     app = QApplication(sys.argv)
-
-    # Load GUI and Controller
-    # controller = MainController()
-
-    # For now, just show the GUI standalone as controller is not fully wired
-    gui = ChatGUI() # from gui.gui_main_window
-
-    # --- Example: Simulate NetworkHandler signals to GUI for testing ---
-    @pyqtSlot(str)
-    def test_gui_send_message(message):
-        gui.append_message_to_display(f"GUI Test (send_message_signal): '{message}' would be sent to current peer.")
-
-    @pyqtSlot(str, str)
-    def test_gui_connect_peer(host, port):
-        gui.append_message_to_display(f"GUI Test (connect_to_peer_signal): Connect to {host}:{port}")
-        # Simulate connection status and new peer
-        gui.append_message_to_display(f"System Status ({host}:{port}): connected_outbound")
-        gui.update_peer_list([f"{host}:{port} (Simulated)"]) # Example update
-
-    gui.send_message_signal.connect(test_gui_send_message)
-    gui.connect_to_peer_signal.connect(test_gui_connect_peer)
-
-    # Simulate receiving a message
-    # In real app, this would come from NetworkHandler via controller
-    # gui.append_message_to_display("PeerX: Hello from simulated peer!")
-
-    gui.show()
-
+    controller = MainController()
     exit_code = app.exec_()
-    # controller.shutdown() # If controller was used
+    # Controller shutdown is now tied to GUI destruction or can be called explicitly if needed
+    # controller.shutdown() # This might be redundant if on_gui_destroyed works as expected
     sys.exit(exit_code)
+
+# Note: The placeholder SessionCipher from the original file was removed as we have a real one.
+# Ensure all imports for TCPServer, TCPClient, DHExchange, SessionCipher are correct.
+# The `send_framed_data` and `receive_framed_data` helpers are now part of this file.
+# A proper import structure (e.g. from .network_core.tcp_handler import ...) is assumed if files are in packages.
+# For current flat structure, direct imports are used.
+# Socket import might be needed in NetworkWorker if not handled by tcp_handler's close methods.
+import socket # Added for socket.SHUT_RDWR in cleanup_connection
