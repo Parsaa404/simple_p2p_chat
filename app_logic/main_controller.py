@@ -276,6 +276,14 @@ class NetworkWorker(QObject):
 
 
 class MainController(QObject):
+    # --- Controller signals to Worker slots (queued connection) ---
+    # These ensure calls to network_worker methods happen in the network_thread
+    # Must be defined at class level for Qt's MOC to pick them up.
+    start_server_trigger = pyqtSignal(int)
+    connect_to_peer_trigger = pyqtSignal(str, str)
+    send_message_trigger = pyqtSignal(str, str)
+    stop_worker_trigger = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         self.gui = ChatGUI()
@@ -299,13 +307,7 @@ class MainController(QObject):
         self.network_worker.new_peer_connected_signal.connect(self.on_worker_new_peer_connected)
         self.network_worker.server_status_signal.connect(self.on_worker_server_status)
 
-        # --- Controller signals to Worker slots (queued connection) ---
-        # These ensure calls to network_worker methods happen in the network_thread
-        self.start_server_trigger = pyqtSignal(int)
-        self.connect_to_peer_trigger = pyqtSignal(str, str)
-        self.send_message_trigger = pyqtSignal(str, str)
-        self.stop_worker_trigger = pyqtSignal()
-
+        # Connect the class-level signals to the worker's slots
         self.start_server_trigger.connect(self.network_worker.start_server_slot)
         self.connect_to_peer_trigger.connect(self.network_worker.connect_to_peer_slot)
         self.send_message_trigger.connect(self.network_worker.send_message_to_peer_slot)
